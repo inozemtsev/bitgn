@@ -1,0 +1,39 @@
+[project]
+name = "bitgn-agent"
+version = "0.1.0"
+description = "Multi-provider adaptive agent for BitGN benchmarks"
+requires-python = ">=3.14"
+dependencies = [
+    # --- BitGN SDK (ConnectRPC + generated Protobuf stubs) ----
+    # SDK pins are rewritten by the build after `buf push`.
+    "bitgn-api-connectrpc-python==0.9.0.1.20260405144405+6b39e6872349",
+    "bitgn-api-protocolbuffers-python==34.1.0.1.20260405144405+6b39e6872349",
+
+    # --- Agent framework (includes openai + anthropic + pydantic) ---
+    "pydantic-ai[openai,anthropic]>=0.2.0",
+
+    # --- Observability (Logfire + OpenTelemetry) ---
+    "logfire>=4.0.0",
+
+    # --- MCP server for native Codex integration ---
+    "mcp>=1.27.0",
+
+    # Keep protobuf runtime aligned with the generated Buf SDK version
+    # to avoid ImportError on google.protobuf.runtime_version.
+    "protobuf>=7.34.1",
+]
+
+[[tool.uv.index]]
+url = "https://buf.build/gen/python"
+
+[tool.uv]
+# Flat, runnable checkout – no package to install.
+# Just `uv run python main.py`.
+package = false
+
+# logfire's otel exporter pins protobuf<7 but BitGN SDK needs >=7.34.1.
+# protobuf 7 is wire-compatible; override to resolve the conflict.
+override-dependencies = [
+    "opentelemetry-proto>=1.39.0",
+    "protobuf>=7.34.1",
+]
