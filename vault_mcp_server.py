@@ -10,17 +10,22 @@ Environment variables (set by codex_agent.py before `codex exec`):
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 import re
 import sys
 import time
+import tomllib
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import logfire
+import yaml
 from opentelemetry import context as otel_context, propagate
 
-from vault_utils import format_mini_outline, format_pcm_tree, wrap_content
+from vault_utils import format_mini_outline, format_pcm_tree, infer_file_meta, wrap_content
 
 logfire.configure(
     service_name="vault-mcp-server",
@@ -182,6 +187,101 @@ def vault_read(path: str, start_line: int = 0, end_line: int = 0) -> str:
     return wrap_content(path, result.content, start_line, end_line)
 
 
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)(?:\r?\n)---(?:\r?\n|\Z)", re.DOTALL)
+
+
+def _snippet(content: str, line: int, col: int) -> str:
+    """Return an N | line\n      ^ snippet pointing at (1-based line, 1-based col)."""
+    lines = content.splitlines()
+    if line < 1 or line > len(lines):
+        return ""
+    prefix = f"    {line} | "
+    caret_pad = " " * (len(prefix) + max(col - 1, 0))
+    return f"{prefix}{lines[line - 1]}\n{caret_pad}^"
+
+
+def _format_error(
+    path: str, fmt: str, line: int | None, col: int | None, msg: str, content: str
+) -> str:
+    loc = ""
+    snippet = ""
+    if line is not None and col is not None:
+        loc = f"\n  line {line}, col {col}: {msg}"
+        snip = _snippet(content, line, col)
+        if snip:
+            snippet = f"\n\n{snip}"
+    elif line is not None:
+        loc = f"\n  line {line}: {msg}"
+    else:
+        loc = f"\n  {msg}"
+    return (
+        f"vault_write rejected: invalid {fmt} content in {path} (format={fmt}){loc}"
+        f"{snippet}\n\nFix the content and call vault_write again."
+    )
+
+
+def _validate_structured_content(path: str, content: str) -> str | None:
+    """Syntactically validate file content based on inferred format.
+
+    Returns an error message string if invalid, or None if valid / not checkable.
+    """
+    fmt = infer_file_meta(path).format
+    try:
+        if fmt == "json":
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as e:
+                return _format_error(path, "json", e.lineno, e.colno, e.msg, content)
+        elif fmt == "yaml":
+            try:
+                yaml.safe_load(content)
+            except yaml.YAMLError as e:
+                mark = getattr(e, "problem_mark", None)
+                msg = getattr(e, "problem", None) or str(e)
+                line = mark.line + 1 if mark else None
+                col = mark.column + 1 if mark else None
+                return _format_error(path, "yaml", line, col, msg, content)
+        elif fmt == "toml":
+            try:
+                tomllib.loads(content)
+            except tomllib.TOMLDecodeError as e:
+                # TOMLDecodeError in 3.11+ carries .lineno/.colno on some versions; fall back to str.
+                line = getattr(e, "lineno", None)
+                col = getattr(e, "colno", None)
+                return _format_error(path, "toml", line, col, str(e), content)
+        elif fmt == "xml":
+            try:
+                ET.fromstring(content)
+            except ET.ParseError as e:
+                line, col = (e.position if hasattr(e, "position") else (None, None))
+                return _format_error(path, "xml", line, col, str(e), content)
+        elif fmt == "csv":
+            try:
+                list(csv.reader(io.StringIO(content)))
+            except csv.Error as e:
+                return _format_error(path, "csv", None, None, str(e), content)
+        elif fmt == "markdown":
+            m = _FRONTMATTER_RE.match(content)
+            if m:
+                block = m.group(1)
+                try:
+                    yaml.safe_load(block)
+                except yaml.YAMLError as e:
+                    mark = getattr(e, "problem_mark", None)
+                    msg = getattr(e, "problem", None) or str(e)
+                    # Frontmatter starts on line 2 of the file (after the opening `---`).
+                    line = (mark.line + 2) if mark else None
+                    col = (mark.column + 1) if mark else None
+                    return _format_error(
+                        path, "markdown-frontmatter", line, col, msg, content
+                    )
+    except Exception as e:
+        # Never let the validator itself crash the write path — log and allow.
+        _log(f"vault_write validator error (ignored): {e!r}")
+        return None
+    return None
+
+
 @server.tool()
 @logfire.instrument("vault_write path={path}", record_return=True)
 def vault_write(path: str, content: str, start_line: int = 0, end_line: int = 0) -> str:
@@ -197,6 +297,12 @@ def vault_write(path: str, content: str, start_line: int = 0, end_line: int = 0)
         f"vault_write(path={path!r}, content_len={len(content)}, start={start_line}, end={end_line})"
     )
     content = content.rstrip("\n")
+    _log("  content-preview ↓\n" + "\n".join(f"    {i+1:>3} | {l}" for i, l in enumerate(content.splitlines()[:30])) + ("\n    ... (truncated)" if len(content.splitlines()) > 30 else ""))
+    if start_line == 0 and end_line == 0:
+        err = _validate_structured_content(path, content)
+        if err is not None:
+            _log(f"  -> REJECTED: {err.splitlines()[0]}")
+            raise ValueError(err)
     if RUNTIME == "pcm":
         _vm.write(
             WriteRequest(path=path, content=content, start_line=start_line, end_line=end_line)

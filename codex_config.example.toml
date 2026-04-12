@@ -1,0 +1,22 @@
+# Example snippet for ~/.codex/config.toml
+#
+# Codex CLI reads ~/.codex/config.toml on startup. The BitGN agent relies on
+# the `bitgn-vault` MCP server being registered there and pointing at THIS
+# checkout of vault_mcp_server.py — otherwise Codex will spawn a stale copy
+# from some other directory and validator / prompt changes in this repo will
+# have no effect.
+#
+# Copy the block below into your ~/.codex/config.toml (merging with whatever
+# is already there) and replace `/ABS/PATH/TO/bitgn-clean` with the absolute
+# path of this repo on your machine.
+
+[mcp_servers.bitgn-vault]
+command = "uv"
+args = ["run", "python", "/ABS/PATH/TO/bitgn-clean/vault_mcp_server.py"]
+
+[mcp_servers.bitgn-vault.env]
+# VAULT_HARNESS_URL is rewritten per-task by codex_agent.py; the value here
+# is only used if you invoke the MCP server outside the agent.
+VAULT_HARNESS_URL = "https://vm-EXAMPLE.eu.bitgn.com"
+VAULT_RUNTIME     = "pcm"
+VAULT_MCP_LOG     = "/ABS/PATH/TO/bitgn-clean/vault_mcp.log"

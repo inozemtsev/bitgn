@@ -1,8 +1,17 @@
-"""Quick script to explore vault contents for a specific task.
+"""Quick read-only exploration of a BitGN task's vault.
+
+Uses `start_playground` for all benchmarks (including pac1-prod), so no
+leaderboard run is ever created. Prints the instruction + vault tree, reads
+interesting files, ends the trial.
 
 Usage:
-    uv run python explore_task.py t20                  # list inbox + read AGENTS.md
-    uv run python explore_task.py t20 path/to/file.md  # read specific files
+    BENCH_ID=bitgn/pac1-prod uv run python explore_task.py t005
+    BENCH_ID=bitgn/pac1-prod uv run python explore_task.py t022 00_inbox/000_invoice-bundle-request.md
+    BENCH_ID=bitgn/sandbox    uv run python explore_task.py t01
+
+Env:
+    BENCH_ID        - bitgn/sandbox | bitgn/pac1-dev | bitgn/pac1-prod
+    BITGN_HOST      - default https://api.bitgn.com
 """
 
 from __future__ import annotations
@@ -19,9 +28,6 @@ from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import (
     EndTrialRequest,
     StartPlaygroundRequest,
-    StartRunRequest,
-    StartTrialRequest,
-    SubmitRunRequest,
 )
 from bitgn.vm.mini_connect import MiniRuntimeClientSync
 from bitgn.vm.mini_pb2 import (
@@ -37,43 +43,47 @@ from bitgn.vm.pcm_pb2 import (
 )
 
 BITGN_HOST = os.getenv("BITGN_HOST") or "https://api.bitgn.com"
-BITGN_API_KEY = os.getenv("BITGN_API_KEY") or ""
 BENCH_ID = os.getenv("BENCH_ID") or "bitgn/pac1-dev"
 
 
-def _find_trial(client: HarnessServiceClientSync, task_id: str) -> tuple[Any, str | None]:
-    """Return (trial, run_id). In PAC1 mode the caller must submit_run(run_id) when done."""
-    if "sandbox" in BENCH_ID:
-        trial = client.start_playground(
-            StartPlaygroundRequest(benchmark_id=BENCH_ID, task_id=task_id)
-        )
-        return trial, None
+def _is_sandbox() -> bool:
+    return "sandbox" in BENCH_ID
 
-    run = client.start_run(
-        StartRunRequest(name="explore", benchmark_id=BENCH_ID, api_key=BITGN_API_KEY)
+
+def _find_trial(client: HarnessServiceClientSync, task_id: str) -> Any:
+    """Start a playground trial for task_id. Never creates a leaderboard run."""
+    return client.start_playground(
+        StartPlaygroundRequest(benchmark_id=BENCH_ID, task_id=task_id)
     )
-    for tid in run.trial_ids:
-        t = client.start_trial(StartTrialRequest(trial_id=tid))
-        if t.task_id == task_id:
-            return t, run.run_id
-    client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
-    raise RuntimeError(f"Task {task_id} not found in run")
 
 
-def _print_tree_pcm(vm: PcmRuntimeClientSync) -> None:
-    tree = vm.tree(TreeRequest(root="/", level=3))
-    print("=== TREE (level 3) ===")
-    for c in tree.root.children:
-        print(f"  {c.name}")
+def _tree_pcm(vm: PcmRuntimeClientSync, level: int = 3) -> list[str]:
+    tree = vm.tree(TreeRequest(root="/", level=level))
+    top: list[str] = []
+
+    def walk(entry: Any, depth: int, prefix: str = "") -> None:
+        for c in entry.children:
+            name = c.name
+            kind = "/" if c.children or (getattr(c, "is_dir", False)) else ""
+            print(f"{prefix}{name}{kind}")
+            if depth == 0:
+                top.append(name)
+            if c.children and depth < level - 1:
+                walk(c, depth + 1, prefix + "  ")
+
+    walk(tree.root, 0)
+    return top
 
 
-def _print_tree_mini(vm: MiniRuntimeClientSync) -> None:
+def _tree_mini(vm: MiniRuntimeClientSync) -> list[str]:
     tree = vm.outline(OutlineRequest(path="/"))
-    print("=== TREE ===")
+    top: list[str] = []
     for folder in tree.folders:
         print(f"  {folder}/")
+        top.append(folder.rstrip("/"))
     for f in tree.files:
         print(f"  {f.path}")
+    return top
 
 
 def _read_pcm(vm: PcmRuntimeClientSync, path: str) -> str:
@@ -94,75 +104,78 @@ def _list_mini(vm: MiniRuntimeClientSync, path: str) -> list[str]:
     return [f"{f}/" for f in r.folders] + list(r.files)
 
 
+# Directories we want to auto-inspect if they exist. Covers both the
+# sandbox-style ("inbox/", "docs/") and PAC1-style ("00_inbox/", "99_system/")
+# lane names. `_find_candidates` checks actual presence against the vault tree.
+_INBOX_HINTS = ("inbox", "00_inbox")
+_SYSTEM_HINTS = ("99_system", "docs")
+_OUTBOX_HINTS = ("60_outbox", "outbox")
+
+
 def explore(task_id: str, extra_files: list[str]) -> None:
     client = HarnessServiceClientSync(BITGN_HOST)
-    trial, run_id = _find_trial(client, task_id)
+    trial = _find_trial(client, task_id)
 
-    print(f"Task: {task_id}")
+    print(f"Task:        {task_id}")
     print(f"Instruction: {trial.instruction}")
-    print(f"Harness URL: {trial.harness_url}\n")
+    print(f"Harness:     {trial.harness_url}\n")
 
-    use_pcm = "sandbox" not in BENCH_ID
+    use_pcm = not _is_sandbox()
     pcm_vm = PcmRuntimeClientSync(trial.harness_url) if use_pcm else None
     mini_vm = None if use_pcm else MiniRuntimeClientSync(trial.harness_url)
 
-    if pcm_vm is not None:
-        _print_tree_pcm(pcm_vm)
-    else:
-        assert mini_vm is not None
-        _print_tree_mini(mini_vm)
-    print()
+    try:
+        print("=== TREE ===")
+        top_dirs = _tree_pcm(pcm_vm) if pcm_vm else _tree_mini(mini_vm)  # type: ignore[arg-type]
+        print()
 
-    def list_dir(path: str) -> list[str]:
-        if pcm_vm is not None:
-            return _list_pcm(pcm_vm, path)
-        assert mini_vm is not None
-        return _list_mini(mini_vm, path)
+        def list_dir(path: str) -> list[str]:
+            if pcm_vm is not None:
+                return _list_pcm(pcm_vm, path)
+            assert mini_vm is not None
+            return _list_mini(mini_vm, path)
 
-    def read_file(path: str) -> str:
-        if pcm_vm is not None:
-            return _read_pcm(pcm_vm, path)
-        assert mini_vm is not None
-        return _read_mini(mini_vm, path)
+        def read_file(path: str) -> str:
+            if pcm_vm is not None:
+                return _read_pcm(pcm_vm, path)
+            assert mini_vm is not None
+            return _read_mini(mini_vm, path)
 
-    files_to_read = list(extra_files)
-    if not files_to_read:
-        files_to_read = ["AGENTS.md"]
-        for subdir in ("inbox", "docs/channels"):
+        files_to_read = list(extra_files)
+        if not files_to_read:
+            files_to_read = ["AGENTS.md", "AGENTS.MD"]
+            top_lower = {d.lower().rstrip("/") for d in top_dirs}
+            for hint in _INBOX_HINTS + _SYSTEM_HINTS + _OUTBOX_HINTS:
+                if hint.lower() in top_lower:
+                    try:
+                        items = list_dir(hint)
+                        print(f"{hint}/: {items}")
+                        for f in items:
+                            if not f.endswith("/"):
+                                files_to_read.append(f"{hint}/{f}")
+                    except Exception as exc:
+                        print(f"{hint}/: ERROR {exc}")
+
+        seen: set[str] = set()
+        for path in files_to_read:
+            if path in seen:
+                continue
+            seen.add(path)
             try:
-                items = list_dir(subdir)
-                for f in items:
-                    if not f.endswith("/"):
-                        files_to_read.append(f"{subdir}/{f}")
-                print(f"{subdir}: {items}")
-            except Exception:
-                pass
-
-        try:
-            docs = list_dir("docs")
-            for f in docs:
-                if "inbox" in f.lower() and not f.endswith("/"):
-                    files_to_read.append(f"docs/{f}")
-            print(f"docs: {docs}")
-        except Exception:
-            pass
-
-        if "inbox/README.md" not in files_to_read:
-            files_to_read.append("inbox/README.md")
-
-    for path in files_to_read:
-        try:
-            content = read_file(path)
-            print(f"\n=== {path} ({len(content)} chars) ===")
-            print(content)
-        except Exception as exc:
-            print(f"\n=== {path} === ERROR: {exc}")
-
-    client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
-    if run_id is not None:
-        client.submit_run(SubmitRunRequest(run_id=run_id, force=True))
+                content = read_file(path)
+                print(f"\n=== {path} ({len(content)} chars) ===")
+                print(content)
+            except Exception as exc:
+                # silently skip the AGENTS.md/AGENTS.MD fallback pair misses
+                if path in ("AGENTS.md", "AGENTS.MD"):
+                    continue
+                print(f"\n=== {path} === ERROR: {exc}")
+    finally:
+        client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
 
 
 if __name__ == "__main__":
-    task_id = sys.argv[1] if len(sys.argv) > 1 else "t20"
-    explore(task_id, sys.argv[2:])
+    if len(sys.argv) < 2:
+        print("Usage: uv run python explore_task.py <task_id> [path ...]")
+        sys.exit(2)
+    explore(sys.argv[1], sys.argv[2:])

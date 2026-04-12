@@ -39,6 +39,12 @@ make sync               # install dependencies
 cp .env.example .env    # fill in API keys
 ```
 
+### Codex MCP config
+
+Codex CLI reads `~/.codex/config.toml` on startup and spawns the `bitgn-vault` MCP server from the path registered there. The `[mcp_servers.bitgn-vault]` block must point at **this** checkout's `vault_mcp_server.py` — otherwise changes made in this repo (validator, tools, logging) are ignored silently. A sample config is included for reference at [`codex_config.example.toml`](codex_config.example.toml); add an equivalent block to `~/.codex/config.toml` with absolute paths for your machine. `VAULT_HARNESS_URL` in the config is a placeholder — `codex_agent.py` overrides it per task.
+
+This setup will be dockerized in a future iteration so the MCP server path, Python env, and `yq` dependency are all pinned inside the container and the host `~/.codex/config.toml` edit is no longer required.
+
 ### Environment Variables
 
 | Variable | Description |

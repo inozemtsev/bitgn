@@ -21,6 +21,9 @@ dependencies = [
     # --- Env loading ---
     "python-dotenv>=1.0.0",
 
+    # --- Structured-content validation in vault_write ---
+    "pyyaml>=6.0",
+
     # Keep protobuf runtime aligned with the generated Buf SDK version
     # to avoid ImportError on google.protobuf.runtime_version.
     "protobuf>=7.34.1",
