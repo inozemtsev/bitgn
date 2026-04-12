@@ -14,6 +14,7 @@ Usage:
 import os
 import sys
 import time
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -21,8 +22,8 @@ load_dotenv()
 
 from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import (
-    StartPlaygroundRequest,
     EndTrialRequest,
+    StartPlaygroundRequest,
 )
 from bitgn.vm.mini_connect import MiniRuntimeClientSync
 from bitgn.vm.mini_pb2 import (
@@ -32,7 +33,9 @@ from bitgn.vm.mini_pb2 import (
     WriteRequest as MiniWriteRequest,
 )
 
+from config import DEFAULT_MODEL
 from tests.synthetic_tasks import ALL_TASKS, TASKS_BY_ID, SyntheticTask
+from vault_utils import C_BLUE, C_CLR, C_CYAN, C_GREEN, C_RED
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -40,14 +43,6 @@ BITGN_HOST = os.getenv("BITGN_HOST") or "https://api.bitgn.com"
 SANDBOX_BENCH = "bitgn/sandbox"
 # We use sandbox task t01 as a template — we'll overwrite its vault contents
 TEMPLATE_TASK = "t01"
-
-# Terminal colors
-C_RED = "\x1B[31m"
-C_GREEN = "\x1B[32m"
-C_BLUE = "\x1B[34m"
-C_YELLOW = "\x1B[33m"
-C_CYAN = "\x1B[36m"
-C_CLR = "\x1B[0m"
 
 
 def _clear_vault(vm: MiniRuntimeClientSync) -> None:
@@ -93,10 +88,12 @@ def _populate_vault(vm: MiniRuntimeClientSync, files: dict[str, str]) -> None:
             print(f"  {C_RED}Failed to write {path}: {e}{C_CLR}")
 
 
-def run_task(task: SyntheticTask) -> dict:
+def run_task(task: SyntheticTask) -> dict[str, Any]:
     """Run a single synthetic task and return results."""
     print(f"\n{'=' * 30} {task.task_id} {'=' * 30}")
-    print(f"{C_BLUE}Instruction: {task.instruction[:100]}{'...' if len(task.instruction) > 100 else ''}{C_CLR}")
+    print(
+        f"{C_BLUE}Instruction: {task.instruction[:100]}{'...' if len(task.instruction) > 100 else ''}{C_CLR}"
+    )
     print(f"Expected: {C_CYAN}{task.expected_outcome}{C_CLR}")
     print(f"Tests: {task.description}")
     print("-" * 80)
@@ -115,13 +112,13 @@ def run_task(task: SyntheticTask) -> dict:
     _populate_vault(vm, task.vault_files)
 
     # Import here to avoid circular imports
-    from agent import run_agent
+    from codex_agent import run_codex_agent
 
     # Run the agent with our custom instruction
     started = time.time()
     try:
-        run_agent(
-            model=os.getenv("MODEL_ID", "gpt-4.1-2025-04-14"),
+        run_codex_agent(
+            model=os.getenv("MODEL_ID", DEFAULT_MODEL),
             harness_url=trial.harness_url,
             task_text=task.instruction,
             runtime="mini",
@@ -147,9 +144,9 @@ def run_task(task: SyntheticTask) -> dict:
     }
 
 
-def list_tasks():
+def list_tasks() -> None:
     """Print all available synthetic tasks."""
-    categories = {}
+    categories: dict[str, list[SyntheticTask]] = {}
     for task in ALL_TASKS:
         cat = task.task_id.split("-")[0]
         categories.setdefault(cat, []).append(task)
@@ -169,7 +166,7 @@ def list_tasks():
         print()
 
 
-def main():
+def main() -> None:
     args = sys.argv[1:]
 
     if "--list" in args:
@@ -205,18 +202,22 @@ def main():
             break
         except Exception as e:
             print(f"{C_RED}Runner error for {task.task_id}: {e}{C_CLR}")
-            results.append({
-                "task_id": task.task_id,
-                "elapsed": 0,
-                "expected_outcome": task.expected_outcome,
-                "error": str(e),
-            })
+            results.append(
+                {
+                    "task_id": task.task_id,
+                    "elapsed": 0,
+                    "expected_outcome": task.expected_outcome,
+                    "error": str(e),
+                }
+            )
 
     # Summary
     if results:
         print(f"\n{'=' * 40} SUMMARY {'=' * 40}")
         for r in results:
-            print(f"  {r['task_id']:12s} expected={r['expected_outcome']:30s} ({r['elapsed']:.1f}s)")
+            print(
+                f"  {r['task_id']:12s} expected={r['expected_outcome']:30s} ({r['elapsed']:.1f}s)"
+            )
         print()
 
 

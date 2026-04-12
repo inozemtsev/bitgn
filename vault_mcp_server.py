@@ -1,21 +1,26 @@
-"""
-MCP server exposing BitGN vault tools for native Codex integration.
+"""MCP server exposing BitGN vault tools for native Codex integration.
 
 Runs as a stdio MCP server outside the Codex sandbox, making gRPC calls
 to the BitGN VM on behalf of the Codex agent.
 
-Environment variables (set by codex_loop.py before `codex exec`):
+Environment variables (set by codex_agent.py before `codex exec`):
     VAULT_HARNESS_URL  - gRPC endpoint for the BitGN VM
     VAULT_RUNTIME      - "pcm" or "mini"
 """
 
+from __future__ import annotations
+
 import json
 import os
+import re
 import sys
 import time
+from typing import Any
 
 import logfire
 from opentelemetry import context as otel_context, propagate
+
+from vault_utils import format_mini_outline, format_pcm_tree, wrap_content
 
 logfire.configure(
     service_name="vault-mcp-server",
@@ -24,7 +29,7 @@ logfire.configure(
     distributed_tracing=True,
 )
 
-# Attach parent trace context propagated from codex_loop.py
+# Attach parent trace context propagated from codex_agent.py.
 _traceparent = os.environ.get("TRACEPARENT", "")
 if _traceparent:
     _parent_ctx = propagate.extract({"traceparent": _traceparent})
@@ -32,27 +37,10 @@ if _traceparent:
 
 from mcp.server.fastmcp import FastMCP
 
-# ── Logging (writes to stderr so it doesn't interfere with stdio MCP) ────
+# ── Logging (writes to stderr + optional log file) ───────────────────────
 
 _LOG_FILE = os.environ.get("VAULT_MCP_LOG", "")
-_log_handle = None
-if _LOG_FILE:
-    _log_handle = open(_LOG_FILE, "a")
-
-
-_REFS_FILE = os.environ.get("VAULT_MCP_REFS", "")
-_tracked_refs: set[str] = set()
-
-
-def _track_ref(path: str) -> None:
-    """Track a file path as a grounding reference and flush immediately."""
-    normalized = path.lstrip("/")
-    if normalized:
-        _tracked_refs.add(normalized)
-        # Flush after every track — atexit won't fire if process is killed
-        if _REFS_FILE:
-            with open(_REFS_FILE, "w") as f:
-                json.dump(sorted(_tracked_refs), f)
+_log_handle = open(_LOG_FILE, "a") if _LOG_FILE else None
 
 
 def _log(msg: str) -> None:
@@ -61,6 +49,25 @@ def _log(msg: str) -> None:
         _log_handle.write(line + "\n")
         _log_handle.flush()
     print(line, file=sys.stderr)
+
+
+# ── Grounding-ref tracking ───────────────────────────────────────────────
+
+_REFS_FILE = os.environ.get("VAULT_MCP_REFS", "")
+_tracked_refs: set[str] = set()
+
+
+def _track_ref(path: str) -> None:
+    """Track a file path as a grounding reference and flush immediately."""
+    normalized = path.lstrip("/")
+    if not normalized:
+        return
+    _tracked_refs.add(normalized)
+    # Flush after every track — atexit won't fire if the process is killed.
+    if _REFS_FILE:
+        with open(_REFS_FILE, "w") as f:
+            json.dump(sorted(_tracked_refs), f)
+
 
 # ── Configuration from environment ───────────────────────────────────────
 
@@ -91,7 +98,7 @@ if RUNTIME == "pcm":
     )
     from google.protobuf.json_format import MessageToDict
 
-    _vm = PcmRuntimeClientSync(HARNESS_URL)
+    _vm: Any = PcmRuntimeClientSync(HARNESS_URL)
 else:
     from bitgn.vm.mini_connect import MiniRuntimeClientSync
     from bitgn.vm.mini_pb2 import (
@@ -106,134 +113,11 @@ else:
     _vm = MiniRuntimeClientSync(HARNESS_URL)
 
 
-# ── Formatting helpers (shared with agent.py) ────────────────────────────
+# ── Tree-path collection helpers (only used by vault_discover_policies) ──
 
 
-def _format_tree_entry(entry, prefix: str = "", is_last: bool = True) -> list[str]:
-    branch = "└── " if is_last else "├── "
-    lines = [f"{prefix}{branch}{entry.name}"]
-    child_prefix = f"{prefix}{'    ' if is_last else '│   '}"
-    children = list(entry.children)
-    for idx, child in enumerate(children):
-        lines.extend(
-            _format_tree_entry(child, prefix=child_prefix, is_last=idx == len(children) - 1)
-        )
-    return lines
-
-
-def _format_pcm_tree(result) -> str:
-    root = result.root
-    if not root.name:
-        return "."
-    lines = [root.name]
-    children = list(root.children)
-    for idx, child in enumerate(children):
-        lines.extend(_format_tree_entry(child, is_last=idx == len(children) - 1))
-    return "\n".join(lines)
-
-
-def _format_mini_outline(result) -> str:
-    lines = [result.path]
-    items = []
-    for folder in result.folders:
-        items.append(f"{folder}/")
-    for f in result.files:
-        items.append(f.path)
-    for idx, item in enumerate(items):
-        branch = "└── " if idx == len(items) - 1 else "├── "
-        lines.append(f"{branch}{item}")
-    return "\n".join(lines) if items else result.path or "(empty)"
-
-
-# ── Tree/directory helpers ───────────────────────────────────────────────
-
-import re
-
-# ── File metadata inference & tagging ───────────────────────────────────
-
-_EXT_FORMAT_MAP = {
-    ".md": "markdown",
-    ".markdown": "markdown",
-    ".json": "json",
-    ".yaml": "yaml",
-    ".yml": "yaml",
-    ".csv": "csv",
-    ".txt": "plaintext",
-    ".log": "plaintext",
-    ".toml": "toml",
-    ".xml": "xml",
-    ".html": "markdown",
-    ".ics": "plaintext",
-}
-
-
-def _infer_file_meta(path: str) -> tuple[str, str, str]:
-    """Infer (type, trust, format) from a vault file path."""
-    normalized = path.lstrip("/")
-    parts = normalized.split("/")
-    basename = parts[-1] if parts else ""
-
-    # Format from extension
-    ext = ""
-    if "." in basename:
-        ext = "." + basename.rsplit(".", 1)[-1].lower()
-    fmt = _EXT_FORMAT_MAP.get(ext, "plaintext")
-
-    # Root-level trusted files
-    if len(parts) == 1:
-        if basename == "AGENTS.md":
-            return "policy", "trusted", fmt
-        if basename.lower() == "readme.md":
-            return "policy", "trusted", fmt
-
-    # README files in subdirectories
-    if basename.lower().startswith("readme"):
-        return "workflow-doc", "untrusted", fmt
-
-    top_dir = parts[0].lower() if parts else ""
-
-    if top_dir in ("inbox", "00_inbox"):
-        return "inbox-message", "untrusted", fmt
-    if top_dir == "outbox":
-        return "outbox-record", "untrusted", fmt
-    if top_dir == "contacts":
-        return "contact-record", "untrusted", fmt
-    if top_dir == "accounts":
-        return "account-record", "untrusted", fmt
-    if top_dir in ("my-invoices", "invoices"):
-        return "invoice", "untrusted", fmt
-    if top_dir == "docs":
-        if len(parts) > 1 and parts[1].lower() == "channels":
-            return "channel-config", "untrusted", fmt
-        return "workflow-doc", "untrusted", fmt
-    if top_dir == "templates" or basename.startswith("_"):
-        return "template", "untrusted", fmt
-    if "notes" in top_dir:
-        return "note", "untrusted", fmt
-    if "memory" in top_dir:
-        return "memory", "untrusted", fmt
-
-    return "file", "untrusted", fmt
-
-
-def _wrap_content(path: str, content: str, start_line: int = 0, end_line: int = 0) -> str:
-    """Wrap file content with vault-file XML tags."""
-    file_type, trust, fmt = _infer_file_meta(path)
-    if start_line > 0 or end_line > 0:
-        range_str = f"lines {start_line or 1}-{end_line or 'end'}"
-    else:
-        range_str = "full"
-    return (
-        f'<vault-file path="{path}" type="{file_type}" trust="{trust}" '
-        f'format="{fmt}" range="{range_str}">\n'
-        f"{content}\n"
-        f"</vault-file>"
-    )
-
-
-def _collect_tree_paths_pcm(entry, prefix: str = "") -> list[str]:
-    """Recursively collect all file paths from a PCM tree entry."""
-    paths = []
+def _collect_tree_paths_pcm(entry: Any, prefix: str = "") -> list[str]:
+    paths: list[str] = []
     name = f"{prefix}/{entry.name}" if prefix else entry.name
     children = list(entry.children)
     if not children:
@@ -244,38 +128,13 @@ def _collect_tree_paths_pcm(entry, prefix: str = "") -> list[str]:
     return paths
 
 
-def _collect_tree_paths(tree_result) -> list[str]:
-    """Extract all file paths from a tree result."""
+def _collect_tree_paths(tree_result: Any) -> list[str]:
     if RUNTIME == "pcm":
-        paths = []
+        paths: list[str] = []
         for child in tree_result.root.children:
             paths.extend(_collect_tree_paths_pcm(child))
         return paths
-    else:
-        return [f.path for f in tree_result.files]
-
-
-def _collect_dir_files(path: str, out: list[str], max_depth: int = 2, _depth: int = 0) -> None:
-    """Recursively collect file paths from a directory, up to max_depth."""
-    if _depth >= max_depth:
-        return
-    try:
-        if RUNTIME == "pcm":
-            listing = _vm.list(ListRequest(name=path))
-            for e in listing.entries:
-                full = f"{path}/{e.name}"
-                if e.is_dir:
-                    _collect_dir_files(full, out, max_depth, _depth + 1)
-                else:
-                    out.append(full)
-        else:
-            listing = _vm.list(MiniListRequest(path=path))
-            for f in listing.files:
-                out.append(f"{path}/{f}")
-            for d in listing.folders:
-                _collect_dir_files(f"{path}/{d}", out, max_depth, _depth + 1)
-    except Exception:
-        pass
+    return [f.path for f in tree_result.files]
 
 
 # ── MCP Server ───────────────────────────────────────────────────────────
@@ -295,10 +154,10 @@ def vault_tree(root: str = "/", level: int = 2) -> str:
     _log(f"vault_tree(root={root!r}, level={level})")
     if RUNTIME == "pcm":
         result = _vm.tree(TreeRequest(root=root, level=level))
-        out = _format_pcm_tree(result)
+        out = format_pcm_tree(result)
     else:
         result = _vm.outline(OutlineRequest(path=root or "/"))
-        out = _format_mini_outline(result)
+        out = format_mini_outline(result)
     _log(f"  -> {out[:200]}")
     return out
 
@@ -320,7 +179,7 @@ def vault_read(path: str, start_line: int = 0, end_line: int = 0) -> str:
     else:
         result = _vm.read(MiniReadRequest(path=path))
     _log(f"  -> {len(result.content)} chars")
-    return _wrap_content(path, result.content, start_line, end_line)
+    return wrap_content(path, result.content, start_line, end_line)
 
 
 @server.tool()
@@ -334,10 +193,14 @@ def vault_write(path: str, content: str, start_line: int = 0, end_line: int = 0)
         start_line: 1-based start line for partial write (0 = full overwrite).
         end_line: 1-based end line for partial write (0 = through last line).
     """
-    _log(f"vault_write(path={path!r}, content_len={len(content)}, start={start_line}, end={end_line})")
+    _log(
+        f"vault_write(path={path!r}, content_len={len(content)}, start={start_line}, end={end_line})"
+    )
     content = content.rstrip("\n")
     if RUNTIME == "pcm":
-        _vm.write(WriteRequest(path=path, content=content, start_line=start_line, end_line=end_line))
+        _vm.write(
+            WriteRequest(path=path, content=content, start_line=start_line, end_line=end_line)
+        )
     else:
         _vm.write(MiniWriteRequest(path=path, content=content))
     _log(f"  -> Written to {path}")
@@ -347,11 +210,7 @@ def vault_write(path: str, content: str, start_line: int = 0, end_line: int = 0)
 @server.tool()
 @logfire.instrument("vault_delete path={path}", record_return=True)
 def vault_delete(path: str) -> str:
-    """Delete a file from the vault.
-
-    Args:
-        path: File path to delete.
-    """
+    """Delete a file from the vault."""
     _log(f"vault_delete(path={path!r})")
     if RUNTIME == "pcm":
         _vm.delete(DeleteRequest(path=path))
@@ -364,11 +223,7 @@ def vault_delete(path: str) -> str:
 @server.tool()
 @logfire.instrument("vault_list path={path}", record_return=True)
 def vault_list(path: str = "/") -> str:
-    """List directory contents.
-
-    Args:
-        path: Directory path to list.
-    """
+    """List directory contents."""
     _log(f"vault_list(path={path!r})")
     if RUNTIME == "pcm":
         result = _vm.list(ListRequest(name=path))
@@ -387,13 +242,7 @@ def vault_list(path: str = "/") -> str:
 @server.tool()
 @logfire.instrument("vault_search pattern={pattern} root={root}", record_return=True)
 def vault_search(pattern: str, root: str = "/", limit: int = 10) -> str:
-    """Search file contents with a regex pattern (like grep).
-
-    Args:
-        pattern: Regex pattern to search for.
-        root: Directory to search in.
-        limit: Max number of results.
-    """
+    """Search file contents with a regex pattern (like grep)."""
     _log(f"vault_search(pattern={pattern!r}, root={root!r}, limit={limit})")
     try:
         if RUNTIME == "pcm":
@@ -426,10 +275,6 @@ def vault_grep_count(pattern: str, path: str) -> str:
 
     Use this for ANY counting or aggregation task — it is exact and fast.
     Returns the count as a number.
-
-    Args:
-        pattern: Regex pattern to count matches for (e.g., "blacklist", "status.*active").
-        path: File path to search in.
     """
     _log(f"vault_grep_count(pattern={pattern!r}, path={path!r})")
     _track_ref(path)
@@ -449,18 +294,11 @@ def vault_grep_count(pattern: str, path: str) -> str:
 @server.tool()
 @logfire.instrument("vault_find name={name} root={root}", record_return=True)
 def vault_find(name: str, root: str = "/", kind: str = "all", limit: int = 10) -> str:
-    """Find files or directories by name pattern.
-
-    Args:
-        name: Name pattern to search for.
-        root: Directory to search in.
-        kind: "all", "files", or "dirs".
-        limit: Max number of results.
-    """
+    """Find files or directories by name pattern."""
     _log(f"vault_find(name={name!r}, root={root!r}, kind={kind!r}, limit={limit})")
     if RUNTIME != "pcm":
         return "(find not available in sandbox -- use vault_search instead)"
-    kind_map = {"all": 0, "files": 1, "dirs": 2}
+    kind_map: dict[str, Any] = {"all": 0, "files": 1, "dirs": 2}
     result = _vm.find(FindRequest(root=root, name=name, type=kind_map.get(kind, 0), limit=limit))
     out = json.dumps(MessageToDict(result), indent=2)
     _log(f"  -> {out[:200]}")
@@ -483,14 +321,7 @@ def vault_context() -> str:
 @server.tool()
 @logfire.instrument("vault_read_all_in_dir path={path}", record_return=True)
 def vault_read_all_in_dir(path: str = "/") -> str:
-    """Read ALL files in a directory and return their contents in one call.
-
-    Much faster than listing a directory then reading files one by one.
-    Returns each file with a header showing its path and content.
-
-    Args:
-        path: Directory path to read all files from.
-    """
+    """Read ALL files in a directory and return their contents in one call."""
     _log(f"vault_read_all_in_dir(path={path!r})")
     if RUNTIME == "pcm":
         listing = _vm.list(ListRequest(name=path))
@@ -513,9 +344,12 @@ def vault_read_all_in_dir(path: str = "/") -> str:
                 content = _vm.read(ReadRequest(path=fpath)).content
             else:
                 content = _vm.read(MiniReadRequest(path=fpath)).content
-            parts.append(_wrap_content(fpath, content))
+            parts.append(wrap_content(fpath, content))
         except Exception as exc:
-            parts.append(f'<vault-file path="{fpath}" type="error" trust="untrusted" format="plaintext" range="full">\n(error: {exc})\n</vault-file>')
+            parts.append(
+                f'<vault-file path="{fpath}" type="error" trust="untrusted" '
+                f'format="plaintext" range="full">\n(error: {exc})\n</vault-file>'
+            )
 
     out = "\n\n".join(parts)
     _log(f"  -> {len(files)} files, {len(out)} chars total")
@@ -524,27 +358,18 @@ def vault_read_all_in_dir(path: str = "/") -> str:
 
 @logfire.instrument("vault_discover_policies", record_return=True)
 def vault_discover_policies() -> str:
-    """Discover and return all policy/workflow documents in one call.
-
-    Reads the vault tree, finds all README files and all files referenced
-    by AGENTS.md, and returns their contents. Use this as your FIRST call
-    to understand the workspace rules before acting.
-
-    Returns: tree structure + contents of all policy files found.
-    """
+    """Discover and return all policy/workflow documents in one call."""
     _log("vault_discover_policies()")
-    parts = []
+    parts: list[str] = []
 
-    # 1. Get tree
     if RUNTIME == "pcm":
         tree_result = _vm.tree(TreeRequest(root="/", level=3))
-        tree_text = _format_pcm_tree(tree_result)
+        tree_text = format_pcm_tree(tree_result)
     else:
         tree_result = _vm.outline(OutlineRequest(path="/"))
-        tree_text = _format_mini_outline(tree_result)
+        tree_text = format_mini_outline(tree_result)
     parts.append(f"## Vault structure\n```\n{tree_text}\n```")
 
-    # 2. Read AGENTS.md to find what it references
     agents_content = ""
     try:
         if RUNTIME == "pcm":
@@ -554,20 +379,17 @@ def vault_discover_policies() -> str:
     except Exception:
         pass
 
-    # 3. Extract explicit path references from AGENTS.md
-    path_refs = set()
-    for m in re.finditer(r'`([^`]*?/[^`]*?)`', agents_content):
+    path_refs: set[str] = set()
+    for m in re.finditer(r"`([^`]*?/[^`]*?)`", agents_content):
         path_refs.add(m.group(1).strip().rstrip("/"))
-    for m in re.finditer(r'\]\(([^)]*?/[^)]*?)\)', agents_content):
+    for m in re.finditer(r"\]\(([^)]*?/[^)]*?)\)", agents_content):
         path_refs.add(m.group(1).strip().rstrip("/"))
-    for m in re.finditer(r'(?:^|\s)([\w._-]+/[\w._/-]+)', agents_content):
+    for m in re.finditer(r"(?:^|\s)([\w._-]+/[\w._/-]+)", agents_content):
         path_refs.add(m.group(1).strip().rstrip("/"))
 
-    # 4. Build full path inventory from tree
     all_paths = _collect_tree_paths(tree_result)
 
-    # 5. Collect: READMEs + paths that match AGENTS.md references
-    policy_paths = []
+    policy_paths: list[str] = []
     for p in all_paths:
         basename = p.rsplit("/", 1)[-1] if "/" in p else p
         if "readme" in basename.lower():
@@ -580,8 +402,7 @@ def vault_discover_policies() -> str:
         if parent and parent in path_refs:
             policy_paths.append(p)
 
-    # 6. Deduplicate and read all policy files
-    seen = set()
+    seen: set[str] = set()
     for p in policy_paths:
         normalized = p.lstrip("/")
         if normalized in seen or normalized == "AGENTS.md":
@@ -592,9 +413,12 @@ def vault_discover_policies() -> str:
                 content = _vm.read(ReadRequest(path=normalized)).content
             else:
                 content = _vm.read(MiniReadRequest(path=normalized)).content
-            parts.append(_wrap_content(normalized, content))
+            parts.append(wrap_content(normalized, content))
         except Exception as exc:
-            parts.append(f'<vault-file path="{normalized}" type="error" trust="untrusted" format="plaintext" range="full">\n(error: {exc})\n</vault-file>')
+            parts.append(
+                f'<vault-file path="{normalized}" type="error" trust="untrusted" '
+                f'format="plaintext" range="full">\n(error: {exc})\n</vault-file>'
+            )
 
     out = "\n\n".join(parts)
     _log(f"  -> {len(seen)} policy files, {len(out)} chars total")
@@ -604,11 +428,7 @@ def vault_discover_policies() -> str:
 @server.tool()
 @logfire.instrument("vault_mkdir path={path}", record_return=True)
 def vault_mkdir(path: str) -> str:
-    """Create a directory in the vault.
-
-    Args:
-        path: Directory path to create.
-    """
+    """Create a directory in the vault."""
     _log(f"vault_mkdir(path={path!r})")
     if RUNTIME != "pcm":
         return "(mkdir not available in sandbox)"
@@ -620,12 +440,7 @@ def vault_mkdir(path: str) -> str:
 @server.tool()
 @logfire.instrument("vault_move from={from_name} to={to_name}", record_return=True)
 def vault_move(from_name: str, to_name: str) -> str:
-    """Move or rename a file in the vault.
-
-    Args:
-        from_name: Source path.
-        to_name: Destination path.
-    """
+    """Move or rename a file in the vault."""
     _log(f"vault_move(from={from_name!r}, to={to_name!r})")
     if RUNTIME != "pcm":
         return "(move not available in sandbox)"

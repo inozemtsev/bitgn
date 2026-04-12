@@ -1,7 +1,7 @@
 [project]
 name = "bitgn-agent"
 version = "0.1.0"
-description = "Multi-provider adaptive agent for BitGN benchmarks"
+description = "BitGN Codex agent"
 requires-python = ">=3.14"
 dependencies = [
     # --- BitGN SDK (ConnectRPC + generated Protobuf stubs) ----
@@ -9,8 +9,8 @@ dependencies = [
     "bitgn-api-connectrpc-python==0.9.0.1.20260405144405+6b39e6872349",
     "bitgn-api-protocolbuffers-python==34.1.0.1.20260405144405+6b39e6872349",
 
-    # --- Agent framework (includes openai + anthropic + pydantic) ---
-    "pydantic-ai[openai,anthropic]>=0.2.0",
+    # --- Structured output & validation ---
+    "pydantic>=2.0.0",
 
     # --- Observability (Logfire + OpenTelemetry) ---
     "logfire>=4.0.0",
@@ -18,9 +18,18 @@ dependencies = [
     # --- MCP server for native Codex integration ---
     "mcp>=1.27.0",
 
+    # --- Env loading ---
+    "python-dotenv>=1.0.0",
+
     # Keep protobuf runtime aligned with the generated Buf SDK version
     # to avoid ImportError on google.protobuf.runtime_version.
     "protobuf>=7.34.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
 ]
 
 [[tool.uv.index]]
@@ -37,3 +46,26 @@ override-dependencies = [
     "opentelemetry-proto>=1.39.0",
     "protobuf>=7.34.1",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # line-length handled by formatter; occasional long lines ok
+    "E402",  # conditional imports (load_dotenv, traceparent setup, runtime guards) are intentional
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["config.py", "vault_utils.py", "codex_agent.py", "main.py", "prompts"]
+
+[[tool.mypy.overrides]]
+module = ["bitgn.*", "connectrpc.*", "google.protobuf.*", "mcp.*", "logfire.*", "opentelemetry.*"]
+ignore_missing_imports = true
