@@ -38,9 +38,12 @@ from opentelemetry import propagate
 from pydantic import BaseModel, Field
 
 from config import (
+    AUTO_DISCOVERY,
     CODEX_MULTI_STEP,
     CODEX_REASONING_EFFORT,
     CODEX_TIMEOUT_SEC,
+    COMPACT_PROMPT,
+    GROUNDING_REFS,
     RETRY_ATTEMPTS,
     RETRY_BACKOFF_SEC,
     VAULT_TREE_DEPTH,
@@ -69,6 +72,28 @@ class Outcome(StrEnum):
     NONE_CLARIFICATION = "OUTCOME_NONE_CLARIFICATION"
     NONE_UNSUPPORTED = "OUTCOME_NONE_UNSUPPORTED"
     ERR_INTERNAL = "OUTCOME_ERR_INTERNAL"
+
+
+@dataclass
+class AgentRunRecord:
+    """Per-task telemetry returned by run_codex_agent for aggregation."""
+
+    outcome: str
+    elapsed_s: float
+    message: str = ""
+    grounding_refs: list[str] = None  # type: ignore[assignment]
+    completed_steps: list[str] = None  # type: ignore[assignment]
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        if self.grounding_refs is None:
+            self.grounding_refs = []
+        if self.completed_steps is None:
+            self.completed_steps = []
 
 
 class TaskResult(BaseModel):
@@ -361,12 +386,12 @@ def _build_codex_cmd(
     log_path: str,
     refs_path: str,
     traceparent: str,
-    compact_prompt_path: str,
+    compact_prompt_path: str | None,
     schema_path: str,
     full_prompt: str,
 ) -> list[str]:
     """Assemble the argv for the `codex exec` subprocess."""
-    return [
+    cmd = [
         "codex",
         "exec",
         "--json",
@@ -388,12 +413,11 @@ def _build_codex_cmd(
         f'mcp_servers.bitgn-vault.env.LOGFIRE_TOKEN="{os.environ.get("LOGFIRE_TOKEN", "")}"',
         "-c",
         f'mcp_servers.bitgn-vault.env.TRACEPARENT="{traceparent}"',
-        "-c",
-        f"experimental_compact_prompt_file={compact_prompt_path}",
-        "--output-schema",
-        schema_path,
-        full_prompt,
     ]
+    if compact_prompt_path:
+        cmd += ["-c", f"experimental_compact_prompt_file={compact_prompt_path}"]
+    cmd += ["--output-schema", schema_path, full_prompt]
+    return cmd
 
 
 def _read_server_refs(refs_path: str) -> list[str]:
@@ -429,8 +453,9 @@ def run_codex_agent(
     task_text: str,
     runtime: str = "pcm",
     task_id: str = "",
-) -> None:
+) -> AgentRunRecord:
     """Run a BitGN task using a single codex exec call with MCP tools."""
+    run_started = time.time()
     with logfire.span(
         "codex agent {task_id}",
         task_id=task_id,
@@ -440,7 +465,7 @@ def run_codex_agent(
     ) as span:
         deps = AgentDeps(vm=create_vm(harness_url, runtime), runtime=runtime)
 
-        discovery = _auto_discover(deps, task_id=task_id)
+        discovery = _auto_discover(deps, task_id=task_id) if AUTO_DISCOVERY else ""
         user_prompt = build_prompt(discovery, task_text)
         instructions = INSTRUCTIONS + (MULTI_STEP_PROTOCOL if CODEX_MULTI_STEP else "")
         full_prompt = f"{CODEX_PREAMBLE}{instructions}\n\n{user_prompt}"
@@ -452,7 +477,7 @@ def run_codex_agent(
         schema_path = _write_temp_schema(schema)
 
         here = Path(__file__).resolve().parent
-        compact_prompt_path = str(here / "compact_prompt.md")
+        compact_prompt_path = str(here / "compact_prompt.md") if COMPACT_PROMPT else None
         log_path = str(here / "vault_mcp.log")
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             refs_path = f.name
@@ -501,7 +526,11 @@ def run_codex_agent(
                         stderr=result.stderr[:1000],
                     )
                     _submit_error(deps, "codex exec failed")
-                    return
+                    return AgentRunRecord(
+                        outcome=Outcome.ERR_INTERNAL,
+                        elapsed_s=time.time() - run_started,
+                        error="codex exec failed",
+                    )
 
                 _log_codex_events(output, task_id)
                 response_text, _thread_id, usage = _parse_jsonl(output)
@@ -511,7 +540,11 @@ def run_codex_agent(
                     span.set_attribute("error", True)
                     logfire.error("codex empty response", task_id=task_id)
                     _submit_error(deps, "Empty response from codex exec")
-                    return
+                    return AgentRunRecord(
+                        outcome=Outcome.ERR_INTERNAL,
+                        elapsed_s=time.time() - run_started,
+                        error="empty codex response",
+                    )
 
                 task_result = TaskResult.model_validate_json(response_text)
                 logfire.info(
@@ -542,13 +575,21 @@ def run_codex_agent(
                 span.set_attribute("error", True)
                 logfire.error("codex timeout", task_id=task_id)
                 _submit_error(deps, "codex exec timed out")
-                return
+                return AgentRunRecord(
+                    outcome=Outcome.ERR_INTERNAL,
+                    elapsed_s=time.time() - run_started,
+                    error="codex exec timed out",
+                )
             except Exception as exc:
                 tprint(task_id, f"{C_RED}codex exec error: {exc}{C_CLR}")
                 span.set_attribute("error", True)
                 logfire.error("codex exec error", task_id=task_id, error=str(exc))
                 _submit_error(deps, f"codex exec error: {exc}")
-                return
+                return AgentRunRecord(
+                    outcome=Outcome.ERR_INTERNAL,
+                    elapsed_s=time.time() - run_started,
+                    error=f"codex exec error: {exc}",
+                )
 
         assert task_result is not None
         elapsed = time.time() - started
@@ -569,7 +610,8 @@ def run_codex_agent(
             )
 
         # Server-tracked refs are deterministic; prefer them over model-reported ones.
-        task_result.grounding_refs = _read_server_refs(refs_path)
+        if GROUNDING_REFS:
+            task_result.grounding_refs = _read_server_refs(refs_path)
 
         try:
             deps.vm.submit_answer(
@@ -588,12 +630,26 @@ def run_codex_agent(
     tprint(task_id, f"\n{C_BLUE}ANSWER: {task_result.message}{C_CLR}")
     if task_result.grounding_refs:
         tprint(task_id, f"  Refs: {', '.join(task_result.grounding_refs)}")
+    inp = usage.get("input_tokens", 0) if usage else 0
+    cached = usage.get("cached_input_tokens", 0) if usage else 0
+    out = usage.get("output_tokens", 0) if usage else 0
+    reasoning = (
+        usage.get("output_tokens_details", {}).get("reasoning_tokens", 0) if usage else 0
+    )
     if usage:
-        inp = usage.get("input_tokens", 0)
-        cached = usage.get("cached_input_tokens", 0)
-        out = usage.get("output_tokens", 0)
-        reasoning = usage.get("output_tokens_details", {}).get("reasoning_tokens", 0)
         tprint(
             task_id,
             f"  Tokens: {inp + out} (in={inp} cached={cached} out={out} reasoning={reasoning})",
         )
+
+    return AgentRunRecord(
+        outcome=str(task_result.outcome),
+        elapsed_s=elapsed,
+        message=task_result.message,
+        grounding_refs=list(task_result.grounding_refs),
+        completed_steps=list(task_result.completed_steps),
+        input_tokens=inp,
+        cached_input_tokens=cached,
+        output_tokens=out,
+        reasoning_tokens=reasoning,
+    )

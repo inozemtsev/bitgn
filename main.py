@@ -18,11 +18,15 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import textwrap
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -32,8 +36,8 @@ load_dotenv()  # load .env before any SDK reads API keys
 import logfire
 from connectrpc.errors import ConnectError
 
-from codex_agent import run_codex_agent
-from config import DEFAULT_MODEL
+from codex_agent import AgentRunRecord, run_codex_agent
+from config import ABLATION_FLAGS, DEFAULT_MODEL
 from vault_utils import C_BLUE, C_CLR, C_CYAN, C_GREEN, C_RED, tprint
 
 # ── Observability (Logfire) ──────────────────────────────────────────────
@@ -83,6 +87,56 @@ def _record_score(
     tprint(task_id, f"\n{style}Score: {result.score:0.2f}\n{explain}\n{C_CLR}")
 
 
+def _ablation_config_snapshot() -> dict[str, str]:
+    return {k: os.environ.get(k, "") for k in ABLATION_FLAGS}
+
+
+def _write_run_artifact(
+    *,
+    started_at: float,
+    scores: list[tuple[str, float]],
+    records: dict[str, AgentRunRecord],
+) -> None:
+    """Drop a structured JSON snapshot of this run into runs/."""
+    runs_dir = Path("runs")
+    runs_dir.mkdir(exist_ok=True)
+    score_map = dict(scores)
+    tasks: list[dict[str, Any]] = []
+    for task_id in sorted(set(score_map) | set(records)):
+        rec = records.get(task_id)
+        tasks.append(
+            {
+                "task_id": task_id,
+                "score": score_map.get(task_id),
+                "outcome": rec.outcome if rec else None,
+                "elapsed_s": rec.elapsed_s if rec else None,
+                "input_tokens": rec.input_tokens if rec else 0,
+                "cached_input_tokens": rec.cached_input_tokens if rec else 0,
+                "output_tokens": rec.output_tokens if rec else 0,
+                "reasoning_tokens": rec.reasoning_tokens if rec else 0,
+                "error": rec.error if rec else "",
+            }
+        )
+    final_pct = sum(s for _, s in scores) / len(scores) * 100.0 if scores else 0.0
+    payload = {
+        "run_name": RUN_NAME,
+        "model": MODEL_ID,
+        "bench_id": BENCH_ID,
+        "workers": WORKERS,
+        "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
+        "elapsed_s": time.time() - started_at,
+        "config": _ablation_config_snapshot(),
+        "final_score_pct": final_pct,
+        "task_count": len(scores),
+        "tasks": tasks,
+    }
+    ts = datetime.fromtimestamp(started_at, tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in RUN_NAME)
+    out = runs_dir / f"{safe_name}_{ts}.json"
+    out.write_text(json.dumps(payload, indent=2))
+    print(f"{C_CYAN}Wrote run artifact: {out}{C_CLR}")
+
+
 def run_sandbox(task_filter: list[str]) -> None:
     """Run against sandbox benchmark (no API key, no leaderboard)."""
     from bitgn.harness_connect import HarnessServiceClientSync
@@ -95,7 +149,9 @@ def run_sandbox(task_filter: list[str]) -> None:
     )
 
     scores: list[tuple[str, float]] = []
+    records: dict[str, AgentRunRecord] = {}
     scores_lock = threading.Lock()
+    started_at = time.time()
 
     try:
         with logfire.span(
@@ -126,9 +182,11 @@ def run_sandbox(task_filter: list[str]) -> None:
                 )
                 tprint(tid, f"{C_BLUE}{trial.instruction}{C_CLR}\n{'-' * 80}")
                 try:
-                    run_codex_agent(
+                    rec = run_codex_agent(
                         MODEL_ID, trial.harness_url, trial.instruction, runtime="mini", task_id=tid
                     )
+                    with scores_lock:
+                        records[tid] = rec
                 except Exception as exc:
                     tprint(tid, f"{C_RED}Agent error: {exc}{C_CLR}")
                 result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
@@ -149,6 +207,7 @@ def run_sandbox(task_filter: list[str]) -> None:
         print(f"{C_RED}Interrupted{C_CLR}")
 
     _print_scores(scores)
+    _write_run_artifact(started_at=started_at, scores=scores, records=records)
 
 
 def run_pac1(task_filter: list[str]) -> None:
@@ -171,7 +230,9 @@ def run_pac1(task_filter: list[str]) -> None:
         sys.exit(1)
 
     scores: list[tuple[str, float]] = []
+    records: dict[str, AgentRunRecord] = {}
     scores_lock = threading.Lock()
+    started_at = time.time()
 
     try:
         with logfire.span(
@@ -206,9 +267,11 @@ def run_pac1(task_filter: list[str]) -> None:
                 tprint(tid, f"{'=' * 30} Starting task: {tid} {'=' * 30}")
                 tprint(tid, f"{C_BLUE}{trial.instruction}{C_CLR}\n{'-' * 80}")
                 try:
-                    run_codex_agent(
+                    rec = run_codex_agent(
                         MODEL_ID, trial.harness_url, trial.instruction, runtime="pcm", task_id=tid
                     )
+                    with scores_lock:
+                        records[tid] = rec
                 except Exception as exc:
                     tprint(tid, f"{C_RED}Agent error: {exc}{C_CLR}")
 
@@ -232,6 +295,7 @@ def run_pac1(task_filter: list[str]) -> None:
         print(f"{C_RED}Interrupted{C_CLR}")
 
     _print_scores(scores)
+    _write_run_artifact(started_at=started_at, scores=scores, records=records)
 
 
 def main() -> None:
